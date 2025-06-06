@@ -4,7 +4,7 @@ import kr.hhplus.be.server.external.client.NaverApiClient;
 import kr.hhplus.be.server.external.client.KakaoApiClient;
 import kr.hhplus.be.server.external.dto.naver.NaverSearchResponse;
 import kr.hhplus.be.server.external.dto.naver.NaverSearchItem;
-import kr.hhplus.be.server.restaurant.search.restaurant.domain.Restaurant;
+import kr.hhplus.be.server.restaurant.domain.Restaurant;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.slf4j.Logger;

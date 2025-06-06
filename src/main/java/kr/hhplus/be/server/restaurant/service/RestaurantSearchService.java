@@ -1,3 +1,5 @@
+//키워드 기록 추가
+
 package kr.hhplus.be.server.restaurant.service;
 
 import kr.hhplus.be.server.restaurant.domain.Restaurant;
@@ -9,7 +11,9 @@ import kr.hhplus.be.server.restaurant.repository.SearchResultRepository;
 import kr.hhplus.be.server.restaurant.dto.request.RestaurantSearchRequest;
 import kr.hhplus.be.server.restaurant.dto.response.RestaurantDto;
 import kr.hhplus.be.server.restaurant.dto.response.RestaurantSearchResponse;
+import kr.hhplus.be.server.keyword.service.KeywordService;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
@@ -25,16 +29,19 @@ public class RestaurantSearchService {
     private final SearchRequestRepository searchRequestRepository;
     private final SearchResultRepository searchResultRepository;
     private final ExternalApiService externalApiService;
+    private final KeywordService keywordService;
 
     @Autowired
     public RestaurantSearchService(RestaurantRepository restaurantRepository,
                                    SearchRequestRepository searchRequestRepository,
                                    SearchResultRepository searchResultRepository,
-                                   ExternalApiService externalApiService) {
+                                   ExternalApiService externalApiService,
+                                   KeywordService keywordService) {
         this.restaurantRepository = restaurantRepository;
         this.searchRequestRepository = searchRequestRepository;
         this.searchResultRepository = searchResultRepository;
         this.externalApiService = externalApiService;
+        this.keywordService = keywordService;
     }
 
     public RestaurantSearchResponse searchRestaurants(RestaurantSearchRequest request) {
@@ -43,10 +50,13 @@ public class RestaurantSearchService {
         // 1. 검색 요청 저장
         SearchRequest searchRequest = saveSearchRequest(request);
 
-        // 2. DB에서 검색
+        // 2. 키워드 기록 (비동기)
+        recordKeywordAsync(request.getKeyword(), request.getLocation());
+
+        // 3. DB에서 검색
         List<Restaurant> restaurants = searchFromDatabase(request);
 
-        // 3. DB에 결과가 없으면 외부 API 호출
+        // 4. DB에 결과가 없으면 외부 API 호출
         if (restaurants.isEmpty()) {
             restaurants = searchFromExternalApi(request);
             if (!restaurants.isEmpty()) {
@@ -54,11 +64,21 @@ public class RestaurantSearchService {
             }
         }
 
-        // 4. 검색 결과 저장
+        // 5. 검색 결과 저장
         saveSearchResults(searchRequest.getId(), restaurants);
 
-        // 5. 페이징 처리 및 응답 생성
+        // 6. 페이징 처리 및 응답 생성
         return createPaginatedResponse(restaurants, request);
+    }
+
+    @Async("taskExecutor")
+    protected void recordKeywordAsync(String keyword, String location) {
+        try {
+            keywordService.recordSearchKeyword(keyword, location);
+        } catch (Exception e) {
+            // 키워드 기록 실패가 검색 기능을 방해하지 않도록 로그만 남김
+            System.err.println("키워드 기록 실패: " + e.getMessage());
+        }
     }
 
     @Transactional(readOnly = true)
