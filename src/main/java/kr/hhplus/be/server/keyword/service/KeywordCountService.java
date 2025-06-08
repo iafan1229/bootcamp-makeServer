@@ -5,7 +5,6 @@ import kr.hhplus.be.server.keyword.domain.KeywordCount;
 import kr.hhplus.be.server.keyword.repository.KeywordRepository;
 import kr.hhplus.be.server.keyword.repository.KeywordCountRepository;
 import kr.hhplus.be.server.fake.FakeMemoryMap;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -17,7 +16,6 @@ import java.util.Map;
 import java.util.Optional;
 
 @Service
-@Transactional
 public class KeywordCountService {
 
     private static final Logger logger = LoggerFactory.getLogger(KeywordCountService.class);
@@ -27,7 +25,6 @@ public class KeywordCountService {
     private final RedisService redisService;
     private final FakeMemoryMap memoryMap;
 
-    @Autowired
     public KeywordCountService(KeywordRepository keywordRepository,
                                KeywordCountRepository keywordCountRepository,
                                RedisService redisService,
@@ -47,38 +44,35 @@ public class KeywordCountService {
 
     /**
      * 지역별 키워드 카운트 증가
+     * 트랜잭션 제거 이유: 주요 작업이 Redis/메모리 기반이므로 불필요
+     * DB 작업(ensureKeywordExists)만 별도 트랜잭션 적용
      */
     public void incrementKeywordCount(String keyword, String locationCategory) {
         try {
-            // 1. 키워드 저장 (존재하지 않으면 새로 생성)
+            // 1. DB 작업 - 키워드 존재 확인/생성 (별도 트랜잭션)
             ensureKeywordExists(keyword);
 
-            // 2. Redis 사용 가능하면 Redis에 저장
+            // 2. 캐시/메모리 작업 - 트랜잭션 불필요
             if (redisService.isRedisAvailable()) {
-                redisService.incrementKeywordCount(keyword, locationCategory);
-                logger.debug("Redis에 키워드 카운트 증가: {}", keyword);
+                incrementRedisCount(keyword, locationCategory);
             } else {
-                // 3. Redis 사용 불가능하면 메모리 Map에 저장
-                memoryMap.increment(keyword);
-                logger.debug("메모리 Map에 키워드 카운트 증가: {}", keyword);
+                incrementMemoryCount(keyword);
             }
 
         } catch (Exception e) {
-            logger.error("키워드 카운트 증가 실패: keyword={}, error={}", keyword, e.getMessage());
-            // Redis 실패시 메모리 Map으로 fallback
-            try {
-                memoryMap.increment(keyword);
-                logger.info("Redis 실패로 메모리 Map으로 fallback: {}", keyword);
-            } catch (Exception fallbackError) {
-                logger.error("메모리 Map fallback도 실패: {}", fallbackError.getMessage());
-            }
+            logger.error("키워드 카운트 증가 실패: keyword={}, location={}, error={}",
+                    keyword, locationCategory, e.getMessage(), e);
+            // fallback 처리
+            handleIncrementFallback(keyword);
         }
     }
 
     /**
      * 5분마다 메모리 Map 데이터를 DB로 백업
+     * 트랜잭션 적용: 배치 백업 작업의 원자성 보장
      */
     @Scheduled(fixedRate = 300000) // 5분 = 300,000ms
+    @Transactional
     public void backupMemoryMapToDatabase() {
         if (memoryMap.isEmpty()) {
             return;
@@ -90,10 +84,7 @@ public class KeywordCountService {
             Map<String, Integer> snapshot = memoryMap.getAllData();
 
             for (Map.Entry<String, Integer> entry : snapshot.entrySet()) {
-                String keyword = entry.getKey();
-                Integer count = entry.getValue();
-
-                backupKeywordCount(keyword, count);
+                backupSingleKeywordCount(entry.getKey(), entry.getValue());
             }
 
             // 백업 완료 후 메모리 Map 초기화
@@ -101,15 +92,25 @@ public class KeywordCountService {
             logger.info("메모리 Map 데이터 DB 백업 완료");
 
         } catch (Exception e) {
-            logger.error("메모리 Map 데이터 DB 백업 실패: {}", e.getMessage());
+            logger.error("메모리 Map 데이터 DB 백업 실패: {}", e.getMessage(), e);
+            throw e; // 트랜잭션 롤백을 위해 예외 재발생
         }
     }
 
-    private void ensureKeywordExists(String keyword) {
+    /**
+     * 키워드 존재 확인 및 생성
+     * 트랜잭션 적용: DB 일관성 보장
+     */
+    @Transactional
+    public void ensureKeywordExists(String keyword) {
+        if (isInvalidKeyword(keyword)) {
+            logger.warn("유효하지 않은 키워드: {}", keyword);
+            return;
+        }
+
         Optional<Keyword> existingKeyword = keywordRepository.findByKeyword(keyword);
 
         if (existingKeyword.isEmpty()) {
-            // 키워드 정규화 (공백 제거 등)
             String normalizedKeyword = normalizeKeyword(keyword);
             Keyword newKeyword = new Keyword(keyword, normalizedKeyword);
             keywordRepository.save(newKeyword);
@@ -117,39 +118,72 @@ public class KeywordCountService {
         }
     }
 
-    private void backupKeywordCount(String keyword, Integer memoryCount) {
+    private void incrementRedisCount(String keyword, String locationCategory) {
         try {
-            // 키워드 조회
-            Optional<Keyword> keywordOpt = keywordRepository.findByKeyword(keyword);
-            if (keywordOpt.isEmpty()) {
-                logger.warn("백업할 키워드가 DB에 없음: {}", keyword);
-                return;
-            }
-
-            Keyword keywordEntity = keywordOpt.get();
-            LocalDate today = LocalDate.now();
-
-            // 오늘 날짜의 키워드 카운트 조회
-            Optional<KeywordCount> existingCount = keywordCountRepository
-                    .findByKeywordIdAndLocationCategoryIdAndCountDate(
-                            keywordEntity.getId(), null, today);
-
-            if (existingCount.isPresent()) {
-                // 기존 카운트 업데이트
-                KeywordCount keywordCount = existingCount.get();
-                keywordCount.updateCount(keywordCount.getCount() + memoryCount);
-                keywordCountRepository.save(keywordCount);
-                logger.debug("기존 키워드 카운트 업데이트: {} ({})", keyword, keywordCount.getCount());
-            } else {
-                // 새 카운트 생성
-                KeywordCount newCount = new KeywordCount(keywordEntity.getId(), null, memoryCount);
-                keywordCountRepository.save(newCount);
-                logger.debug("새 키워드 카운트 생성: {} ({})", keyword, memoryCount);
-            }
-
+            redisService.incrementKeywordCount(keyword, locationCategory);
+            logger.debug("Redis에 키워드 카운트 증가: keyword={}, location={}", keyword, locationCategory);
         } catch (Exception e) {
-            logger.error("키워드 카운트 백업 실패: keyword={}, error={}", keyword, e.getMessage());
+            logger.warn("Redis 카운트 증가 실패: keyword={}, error={}", keyword, e.getMessage());
+            throw e; // 상위에서 fallback 처리
         }
+    }
+
+    private void incrementMemoryCount(String keyword) {
+        try {
+            memoryMap.increment(keyword);
+            logger.debug("메모리 Map에 키워드 카운트 증가: {}", keyword);
+        } catch (Exception e) {
+            logger.error("메모리 Map 카운트 증가 실패: keyword={}, error={}", keyword, e.getMessage());
+            throw e;
+        }
+    }
+
+    private void handleIncrementFallback(String keyword) {
+        try {
+            memoryMap.increment(keyword);
+            logger.info("Redis 실패로 메모리 Map으로 fallback: {}", keyword);
+        } catch (Exception fallbackError) {
+            logger.error("메모리 Map fallback도 실패: keyword={}, error={}",
+                    keyword, fallbackError.getMessage(), fallbackError);
+        }
+    }
+
+    private void backupSingleKeywordCount(String keyword, Integer memoryCount) {
+        Optional<Keyword> keywordOpt = keywordRepository.findByKeyword(keyword);
+        if (keywordOpt.isEmpty()) {
+            logger.warn("백업할 키워드가 DB에 없음: {}", keyword);
+            return;
+        }
+
+        Keyword keywordEntity = keywordOpt.get();
+        LocalDate today = LocalDate.now();
+
+        Optional<KeywordCount> existingCount = keywordCountRepository
+                .findByKeywordIdAndLocationCategoryIdAndCountDate(
+                        keywordEntity.getId(), null, today);
+
+        if (existingCount.isPresent()) {
+            updateExistingKeywordCount(existingCount.get(), memoryCount, keyword);
+        } else {
+            createNewKeywordCount(keywordEntity.getId(), memoryCount, keyword);
+        }
+    }
+
+    private void updateExistingKeywordCount(KeywordCount keywordCount, Integer memoryCount, String keyword) {
+        int newCount = keywordCount.getCount() + memoryCount;
+        keywordCount.updateCount(newCount);
+        keywordCountRepository.save(keywordCount);
+        logger.debug("기존 키워드 카운트 업데이트: {} ({})", keyword, newCount);
+    }
+
+    private void createNewKeywordCount(Long keywordId, Integer memoryCount, String keyword) {
+        KeywordCount newCount = new KeywordCount(keywordId, null, memoryCount);
+        keywordCountRepository.save(newCount);
+        logger.debug("새 키워드 카운트 생성: {} ({})", keyword, memoryCount);
+    }
+
+    private boolean isInvalidKeyword(String keyword) {
+        return keyword == null || keyword.trim().isEmpty();
     }
 
     private String normalizeKeyword(String keyword) {
