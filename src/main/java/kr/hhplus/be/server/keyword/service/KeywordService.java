@@ -6,7 +6,6 @@ import kr.hhplus.be.server.keyword.repository.KeywordRepository;
 import kr.hhplus.be.server.keyword.repository.KeywordCountRepository;
 import kr.hhplus.be.server.keyword.dto.response.KeywordDto;
 import kr.hhplus.be.server.keyword.dto.response.PopularKeywordResponse;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.ZSetOperations;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -15,23 +14,24 @@ import org.slf4j.LoggerFactory;
 
 import java.time.LocalDate;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
-import java.util.Optional;
 
 @Service
-@Transactional(readOnly = true)
 public class KeywordService {
 
     private static final Logger logger = LoggerFactory.getLogger(KeywordService.class);
     private static final int DEFAULT_POPULAR_KEYWORD_LIMIT = 10;
+    private static final String REDIS_DATA_SOURCE = "redis";
+    private static final String DATABASE_DATA_SOURCE = "database";
 
     private final KeywordRepository keywordRepository;
     private final KeywordCountRepository keywordCountRepository;
     private final RedisService redisService;
     private final KeywordCountService keywordCountService;
 
-    @Autowired
     public KeywordService(KeywordRepository keywordRepository,
                           KeywordCountRepository keywordCountRepository,
                           RedisService redisService,
@@ -43,76 +43,129 @@ public class KeywordService {
     }
 
     /**
-     * 검색 키워드 기록 (비동기 처리)
+     * 검색 키워드 기록
+     * 키워드 기록 실패가 검색 기능을 방해하지 않도록 예외를 처리합니다.
+     *
+     * 트랜잭션 제거 이유:
+     * - incrementKeywordCount는 주로 Redis/메모리 작업
+     * - DB 작업(ensureKeywordExists)은 keywordCountService 내부에서 처리
+     * - 불필요한 트랜잭션 오버헤드 제거
      */
-    @Transactional
     public void recordSearchKeyword(String keyword, String locationCategory) {
         try {
             keywordCountService.incrementKeywordCount(keyword, locationCategory);
             logger.debug("검색 키워드 기록 완료: keyword={}, location={}", keyword, locationCategory);
         } catch (Exception e) {
-            logger.error("검색 키워드 기록 실패: keyword={}, error={}", keyword, e.getMessage());
-            // 키워드 기록 실패가 검색 기능을 방해하지 않도록 예외를 삼킴
+            logger.error("검색 키워드 기록 실패: keyword={}, location={}, error={}",
+                    keyword, locationCategory, e.getMessage(), e);
         }
     }
 
     /**
-     * 인기 키워드 조회 (Redis 우선, 실패시 DB 조회)
+     * 인기 키워드 조회
+     * Redis 우선 조회, 실패시 DB에서 조회합니다.
      */
     public PopularKeywordResponse getPopularKeywords(String locationCategory, Integer limit) {
-        int actualLimit = limit != null ? limit : DEFAULT_POPULAR_KEYWORD_LIMIT;
+        int actualLimit = getValidatedLimit(limit);
 
-        try {
-            // Redis에서 인기 키워드 조회 시도
-            if (redisService.isRedisAvailable()) {
-                return getPopularKeywordsFromRedis(locationCategory, actualLimit);
-            }
-        } catch (Exception e) {
-            logger.warn("Redis 인기 키워드 조회 실패, DB로 fallback: {}", e.getMessage());
+        // Redis 조회 시도
+        PopularKeywordResponse redisResult = tryGetFromRedis(locationCategory, actualLimit);
+        if (redisResult != null) {
+            return redisResult;
         }
 
         // Redis 실패시 DB에서 조회
         return getPopularKeywordsFromDatabase(locationCategory, actualLimit);
     }
 
-    private PopularKeywordResponse getPopularKeywordsFromRedis(String locationCategory, int limit) {
-        Set<ZSetOperations.TypedTuple<Object>> redisResults;
+    private int getValidatedLimit(Integer limit) {
+        return limit != null && limit > 0 ? limit : DEFAULT_POPULAR_KEYWORD_LIMIT;
+    }
 
-        if (locationCategory != null && !locationCategory.trim().isEmpty()) {
-            redisResults = redisService.getTopKeywordsByLocation(locationCategory, limit);
-        } else {
-            redisResults = redisService.getTopKeywords(limit);
+    private PopularKeywordResponse tryGetFromRedis(String locationCategory, int limit) {
+        try {
+            if (redisService.isRedisAvailable()) {
+                return getPopularKeywordsFromRedis(locationCategory, limit);
+            }
+        } catch (Exception e) {
+            logger.warn("Redis 인기 키워드 조회 실패, DB로 fallback: location={}, error={}",
+                    locationCategory, e.getMessage());
         }
+        return null;
+    }
+
+    private PopularKeywordResponse getPopularKeywordsFromRedis(String locationCategory, int limit) {
+        Set<ZSetOperations.TypedTuple<Object>> redisResults = hasValidLocationCategory(locationCategory)
+                ? redisService.getTopKeywordsByLocation(locationCategory, limit)
+                : redisService.getTopKeywords(limit);
 
         List<KeywordDto> keywords = redisResults.stream()
-                .map(tuple -> new KeywordDto(
-                        tuple.getValue().toString(),
-                        tuple.getScore().intValue()
-                ))
+                .map(this::convertTupleToKeywordDto)
                 .collect(Collectors.toList());
 
-        return new PopularKeywordResponse(keywords, "redis");
+        return new PopularKeywordResponse(keywords, REDIS_DATA_SOURCE);
+    }
+
+    private KeywordDto convertTupleToKeywordDto(ZSetOperations.TypedTuple<Object> tuple) {
+        return new KeywordDto(
+                tuple.getValue().toString(),
+                tuple.getScore().intValue()
+        );
     }
 
     private PopularKeywordResponse getPopularKeywordsFromDatabase(String locationCategory, int limit) {
-        Long locationCategoryId = null;
-        if (locationCategory != null && !locationCategory.trim().isEmpty()) {
-            // locationCategory를 ID로 변환하는 로직 필요 (여기서는 단순화)
-            locationCategoryId = 1L; // 임시
-        }
+        Long locationCategoryId = convertToLocationCategoryId(locationCategory);
 
         List<KeywordCount> keywordCounts = keywordCountRepository
                 .findTopKeywordsByLocationCategoryAndDate(locationCategoryId, LocalDate.now(), limit);
 
-        List<KeywordDto> keywords = keywordCounts.stream()
-                .map(kc -> {
-                    Optional<Keyword> keyword = keywordRepository.findById(kc.getKeywordId());
-                    return keyword.map(k -> new KeywordDto(k.getKeyword(), kc.getCount()))
-                            .orElse(null);
-                })
-                .filter(dto -> dto != null)
+        // N+1 문제 해결: 배치로 키워드 조회
+        List<KeywordDto> keywords = getKeywordDtosBatch(keywordCounts);
+
+        return new PopularKeywordResponse(keywords, DATABASE_DATA_SOURCE);
+    }
+
+    /**
+     * N+1 문제 해결을 위한 배치 조회
+     */
+    private List<KeywordDto> getKeywordDtosBatch(List<KeywordCount> keywordCounts) {
+        if (keywordCounts.isEmpty()) {
+            return List.of();
+        }
+
+        // 1. 키워드 ID 목록 추출
+        List<Long> keywordIds = keywordCounts.stream()
+                .map(KeywordCount::getKeywordId)
                 .collect(Collectors.toList());
 
-        return new PopularKeywordResponse(keywords, "database");
+        // 2. 배치로 키워드 조회 (1번의 쿼리)
+        List<Keyword> keywords = keywordRepository.findAllById(keywordIds);
+
+        // 3. ID를 키로 하는 Map 생성 (빠른 조회용)
+        Map<Long, String> keywordMap = keywords.stream()
+                .collect(Collectors.toMap(Keyword::getId, Keyword::getKeyword));
+
+        // 4. KeywordDto 변환
+        return keywordCounts.stream()
+                .map(kc -> {
+                    String keywordText = keywordMap.get(kc.getKeywordId());
+                    return keywordText != null
+                            ? new KeywordDto(keywordText, kc.getCount())
+                            : null;
+                })
+                .filter(Objects::nonNull)
+                .collect(Collectors.toList());
+    }
+
+    private boolean hasValidLocationCategory(String locationCategory) {
+        return locationCategory != null && !locationCategory.trim().isEmpty();
+    }
+
+    private Long convertToLocationCategoryId(String locationCategory) {
+        if (!hasValidLocationCategory(locationCategory)) {
+            return null;
+        }
+        // TODO: locationCategory를 실제 ID로 변환하는 로직 구현 필요
+        return 1L; // 임시값
     }
 }
